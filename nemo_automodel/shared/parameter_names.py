@@ -32,3 +32,11 @@ def canonical_parameter_fqn(name: str) -> str:
         The logical parameter name without checkpoint-wrapper components.
     """
     return name.replace(_CHECKPOINT_PREFIX, "")
+
+
+# Module attribute: a set of that module's parameter names that the module loads itself (e.g. NF4-resident
+# experts streamed from a floating-point HF checkpoint). ``to_empty_parameters_only`` keeps those parameters
+# on meta and ``Checkpointer.load_model`` leaves them out of the base load. Kept on the module, not on the
+# parameter: ``nn.Module._apply`` swaps DTensor parameters with ``torch.utils.swap_tensors``, which also
+# swaps the Python ``__dict__`` and would drop a per-parameter flag.
+SKIP_CHECKPOINT_LOAD_ATTR = "_skip_checkpoint_load_params"

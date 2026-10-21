@@ -93,7 +93,7 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
-from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from nemo_automodel.shared.parameter_names import SKIP_CHECKPOINT_LOAD_ATTR, canonical_parameter_fqn
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -104,6 +104,12 @@ from nemo_automodel.components.checkpoint.config import CheckpointingConfig, Sav
 
 _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
+
+
+def _skipped_param_names(module: nn.Module) -> set[str]:
+    """Parameter names of ``module`` that it loads itself (see ``SKIP_CHECKPOINT_LOAD_ATTR``)."""
+    return set(getattr(module, SKIP_CHECKPOINT_LOAD_ATTR, ()) or ())
+
 
 logger = logging.getLogger(__name__)
 
@@ -1068,6 +1074,9 @@ class Checkpointer:
             cpu_offload=self.config.cpu_offload,
             has_expert_parallelism=self.moe_mesh is not None,
         )
+        # Parameters a module loads itself (e.g. NF4 expert quantize-on-load) stay on meta; only the standard DCP
+        # path below knows how to leave them out of the base load.
+        skip_load_fqns = _skip_load_param_fqns(model_state.model) if is_init_step else set()
         should_dequantize_base_checkpoint = bool(
             is_init_step
             and _should_dequantize_base_checkpoint(model_state.model[0], self.config.dequantize_base_checkpoint)
@@ -1079,6 +1088,7 @@ class Checkpointer:
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
+            _require_no_skip_load_params(skip_load_fqns, "the transformers tensor-merging conversion")
             if callable(key_mapping):
                 raise ValueError("Tensor-merging checkpoint loads require a regex key mapping, not a callable.")
             converted_state_dict = _convert_checkpoint_with_transformers(model_state.model[0], model_path, key_mapping)
@@ -1147,6 +1157,7 @@ class Checkpointer:
             and (not is_custom_model or world_size == 1)
         )
         if checkpoint_load_parts is not None and part_loaded_model_state_dict is not None:
+            _require_no_skip_load_params(skip_load_fqns, "the part-by-part checkpoint load")
             storage_reader = self._get_storage_reader(
                 model_path,
                 key_mapping=None,
@@ -1171,6 +1182,7 @@ class Checkpointer:
             and len(model_state.model) == 1
             and (_is_bin_checkpoint(model_path) or safetensors_requires_full_cpu)
         ):
+            _require_no_skip_load_params(skip_load_fqns, "the full-state CPU load")
             t0 = time.monotonic()
             # Full-state safetensors remain mmap-backed. Prefault only when the
             # destination shares host memory; CPU and discrete-GPU paths stay unchanged.
@@ -1241,6 +1253,8 @@ class Checkpointer:
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
         direct_load_started = time.monotonic()
         state_dict = model_state.state_dict()
+        if skip_load_fqns:
+            state_dict = _drop_skip_load_entries(model_state.model, state_dict)
         expected_keys = set(state_dict.keys())
         # When the model has a state_dict_adapter, it handles all key transformations
         # (to_hf/from_hf). Passing key_mapping to the storage reader would double-transform
@@ -2424,6 +2438,48 @@ def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: st
     return None
 
 
+def _skip_load_param_fqns(model_parts) -> set[str]:
+    """Canonical FQNs of the parameters some module flagged with ``SKIP_CHECKPOINT_LOAD_ATTR``."""
+    parts = model_parts if isinstance(model_parts, (list, tuple)) else [model_parts]
+    return {
+        canonical_parameter_fqn(f"{mod_name}.{pname}" if mod_name else pname)
+        for part in parts
+        for mod_name, mod in part.named_modules()
+        for pname in _skipped_param_names(mod)
+    }
+
+
+def _require_no_skip_load_params(skip_load_fqns: set[str], load_path: str) -> None:
+    """Refuse init-load paths that cannot leave the flagged parameters out of the base load."""
+    if skip_load_fqns:
+        raise NotImplementedError(
+            f"{len(skip_load_fqns)} parameters are flagged to be loaded by their module (e.g. NF4 expert "
+            f"quantize-on-load), which only the standard DCP base load supports, not {load_path}"
+        )
+
+
+def _drop_skip_load_entries(model_parts, state_dict: dict[str, Any]) -> dict[str, Any]:
+    """Remove state-dict entries of parameters listed in a module's ``SKIP_CHECKPOINT_LOAD_ATTR`` (kept on meta)."""
+    skip = _skip_load_param_fqns(model_parts)
+    if not skip:
+        return state_dict
+    kept = {}
+    dropped = 0
+    for key, value in state_dict.items():
+        if canonical_parameter_fqn(key) in skip:
+            dropped += 1
+            continue
+        if isinstance(value, torch.Tensor) and value.device.type == "meta":
+            raise RuntimeError(f"load_model: {key} is still on meta but not flagged as loaded elsewhere")
+        kept[key] = value
+    if dropped != len(skip):
+        raise RuntimeError(
+            f"load_model: {len(skip)} parameters flagged to skip, but {dropped} state-dict entries matched"
+        )
+    logging.info("load_model: %d parameters are loaded by their owner, skipped in the base load", dropped)
+    return kept
+
+
 def to_empty_parameters_only(
     model: nn.Module, *, device: torch.device, recurse: bool = True, dtype: torch.dtype | None = None
 ) -> nn.Module:
@@ -2686,8 +2742,12 @@ def _apply(module, fn, recurse=True) -> nn.Module:
             return False
 
     should_use_swap_tensors = torch.__future__.get_swap_module_params_on_conversion()
+    skipped = _skipped_param_names(module)
     for key, param in module._parameters.items():
         if param is None:
+            continue
+        # Parameters loaded outside the base checkpoint path (e.g. NF4 expert quantize-on-load) stay on meta.
+        if key in skipped:
             continue
         # Tensors stored in modules are graph leaves, and we don't want to
         # track autograd history of `param_applied`, so we have to use

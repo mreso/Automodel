@@ -24,6 +24,7 @@ for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
@@ -69,7 +70,13 @@ from nemo_automodel.components.models.common.utils import (
     cast_frozen_modules_to_compute_dtype,
     prepare_frozen_parameters_for_sharding,
 )
-from nemo_automodel.components.moe.quantized_experts import apply_mxfp4_to_moe_experts
+from nemo_automodel.components.moe.quantized_experts import (
+    apply_mxfp4_to_moe_experts,
+    apply_nf4_to_moe_experts,
+    assert_nf4_placeholders_on_meta,
+    load_nf4_experts_from_hf_checkpoint,
+    nf4_placeholders_pending,
+)
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.utils.compile_utils import compile_model
@@ -141,6 +148,15 @@ def _validate_safe_moe_tp_weight_source(
         )
 
 
+def _local_checkpoint_dir(pretrained_model_name_or_path: str, cache_dir: str | None) -> str:
+    """Local directory of a pretrained checkpoint: the path itself, or its already downloaded HF snapshot."""
+    if os.path.isdir(pretrained_model_name_or_path):
+        return pretrained_model_name_or_path
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(pretrained_model_name_or_path, cache_dir=cache_dir, local_files_only=True)
+
+
 def _verify_safe_moe_tp_weights_loaded(model, *, checkpoint_loaded: bool) -> None:
     """Fail closed when the safe custom-MoE TP path skipped the checkpoint load."""
     if not _safe_moe_tp_parts(model):
@@ -167,6 +183,8 @@ def _apply_peft_and_lower_precision(
         apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
         if peft_config.expert_weight_format == "mxfp4":
             model = apply_mxfp4_to_moe_experts(model)
+        elif peft_config.expert_weight_format == "nf4":
+            model = apply_nf4_to_moe_experts(model)
 
     # FP8
     if fp8_config is not None:
@@ -759,6 +777,9 @@ def apply_model_infrastructure(
     # When FSDP2 CPU offload is enabled, params must be materialized on CPU —
     # FSDP2 manages GPU placement itself during forward/backward.
     _has_cpu_offload = isinstance(strategy_config, FSDP2Config) and strategy_config.offload_policy is not None
+    # NF4-resident experts built on meta are streamed from the HF checkpoint after the base load (the packed
+    # placeholders stay on meta through materialization and are skipped by the DCP base load).
+    nf4_stream = peft_config is not None and getattr(peft_config, "expert_weight_format", "unquantized") == "nf4"
     if need_materialize:
         init_device = torch.device("cpu") if _has_cpu_offload else device
         model_parts = model.parts if hasattr(model, "parts") else [model]
@@ -770,6 +791,8 @@ def apply_model_infrastructure(
                 # parameter is about to be populated from the pretrained checkpoint.
                 mp._skip_init_weights_on_load = True
             checkpointer.initialize_model_weights(mp, init_device, peft_init_method=lora_a_init)
+            if nf4_stream:
+                assert_nf4_placeholders_on_meta(mp)
 
     # Load the checkpoint if pretrained weights are needed and weren't already loaded
     # (e.g., by HF's from_pretrained on a real device, which also handles BnB
@@ -787,8 +810,19 @@ def apply_model_infrastructure(
                     pretrained_model_name_or_path,
                     load_base_model=load_base_model,
                 )
+                if nf4_stream and nf4_placeholders_pending(mp):
+                    load_nf4_experts_from_hf_checkpoint(
+                        mp, _local_checkpoint_dir(pretrained_model_name_or_path, cache_dir), device=device
+                    )
         finally:
             checkpointer.close()
+    if nf4_stream and not should_load_checkpoint:
+        for mp in model.parts if hasattr(model, "parts") else [model]:
+            if nf4_placeholders_pending(mp):
+                raise RuntimeError(
+                    "NF4-resident experts were built on meta but no base checkpoint load is configured; "
+                    "their packed weights can only be streamed from a pretrained checkpoint"
+                )
 
     _verify_safe_moe_tp_weights_loaded(
         model,
